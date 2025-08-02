@@ -10,8 +10,8 @@ from app.models.schema import (
 )
 
 def get_db():
-    from app.core.config import get_database_session
-    db = get_database_session()
+    from app.core.config import SessionLocal
+    db = SessionLocal()
     try:
         yield db
     finally:
