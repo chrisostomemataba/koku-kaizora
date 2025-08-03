@@ -16,9 +16,11 @@ class TimetableGenerationRequest(BaseModel):
     regenerate_existing: bool = False
     
     @field_validator('week_starting')
-    def week_must_be_monday(cls, v):
-        if v.weekday() != 0:
-            raise ValueError('Week starting date must be a Monday')
+    def week_starting_validation(cls, v):
+        if v < date.today() - timedelta(days=365):
+            raise ValueError('Week starting date cannot be more than 1 year in the past')
+        if v > date.today() + timedelta(days=365):
+            raise ValueError('Week starting date cannot be more than 1 year in the future')
         return v
     
     @field_validator('active_children')
@@ -35,232 +37,184 @@ class TimetableGenerationRequest(BaseModel):
 
 class TimetableValidator:
     def __init__(self):
-        self.working_hours_start = time(8, 0)  # 8 AM
-        self.working_hours_end = time(16, 0)   # 4 PM
+        self.working_hours_start = time(8, 0)
+        self.working_hours_end = time(16, 0)
         self.max_sessions_per_child_per_day = 5
         self.max_sessions_per_therapist_per_day = 8
         self.session_duration_minutes = 60
         self.valid_days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
 
     def validate_generation_request(self, request: TimetableGenerationRequest) -> Tuple[bool, List[str]]:
-        """Comprehensive validation of timetable generation request"""
         errors = []
         
-        # Date validations
-        if request.week_starting < date.today():
-            errors.append("Cannot generate timetable for past weeks")
+        if request.week_starting < date.today() - timedelta(days=365):
+            errors.append("Cannot generate timetable more than 1 year in the past")
         
         if request.week_starting > date.today() + timedelta(days=365):
-            errors.append("Cannot generate timetable more than 1 year in advance")
+            errors.append("Cannot generate timetable more than 1 year in the future")
         
-        # List validations
-        if len(request.active_children) > 50:
-            errors.append("Too many children selected (max 50 per week)")
+        if not request.active_children:
+            errors.append("At least one child must be selected")
         
-        if len(request.active_therapists) > 20:
-            errors.append("Too many therapists selected (max 20 per week)")
-        
-        # Duplicate checks
-        if len(set(request.active_children)) != len(request.active_children):
-            errors.append("Duplicate children IDs found in selection")
-        
-        if len(set(request.active_therapists)) != len(request.active_therapists):
-            errors.append("Duplicate therapist IDs found in selection")
+        if not request.active_therapists:
+            errors.append("At least one therapist must be selected")
         
         return len(errors) == 0, errors
 
-    def validate_child_data(self, children_data: List[Dict[str, Any]]) -> Tuple[bool, List[str]]:
-        """Validate child availability and department requirements"""
+    def validate_child_data(self, children_data: List[Dict]) -> Tuple[bool, List[str]]:
         errors = []
+        
+        if not children_data:
+            errors.append("No valid children data provided")
+            return False, errors
         
         for child in children_data:
-            child_name = child.get('name', f"Child ID {child.get('id')}")
-            
-            # Check if child has departments
-            if not child.get('departments') or len(child['departments']) == 0:
-                errors.append(f"{child_name}: No departments assigned")
+            if not child.get('id'):
+                errors.append(f"Child missing required ID: {child}")
                 continue
-            
-            # Check if child has availability
-            if not child.get('availability') or len(child['availability']) == 0:
-                errors.append(f"{child_name}: No availability schedule set")
-                continue
-            
-            # Validate department session requirements
-            total_weekly_sessions = sum(dept['sessions_per_week'] for dept in child['departments'])
-            if total_weekly_sessions > 25:  # 5 days * 5 max sessions
-                errors.append(f"{child_name}: Too many weekly sessions required ({total_weekly_sessions})")
-            
-            # Validate availability time slots
-            for avail in child['availability']:
-                if not self._is_valid_day(avail['day_of_week']):
-                    errors.append(f"{child_name}: Invalid day '{avail['day_of_week']}'")
                 
-                if not self._is_valid_time_range(avail['start_time'], avail['end_time']):
-                    errors.append(f"{child_name}: Invalid time range {avail['start_time']}-{avail['end_time']}")
+            if not child.get('name'):
+                errors.append(f"Child {child.get('id')} missing name")
+            
+            if not child.get('departments'):
+                errors.append(f"Child {child.get('name', child.get('id'))} has no department assignments")
+                continue
+            
+            total_sessions = sum(dept.get('sessions_per_week', 0) for dept in child['departments'])
+            if total_sessions > self.max_sessions_per_child_per_day * 6:
+                errors.append(f"Child {child.get('name')} has too many sessions per week ({total_sessions})")
+            
+            if not child.get('availability'):
+                errors.append(f"Child {child.get('name')} has no availability set")
         
         return len(errors) == 0, errors
 
-    def validate_therapist_data(self, therapists_data: List[Dict[str, Any]]) -> Tuple[bool, List[str]]:
-        """Validate therapist availability and department coverage"""
+    def validate_therapist_data(self, therapists_data: List[Dict]) -> Tuple[bool, List[str]]:
         errors = []
-        department_coverage = {}
+        
+        if not therapists_data:
+            errors.append("No valid therapist data provided")
+            return False, errors
         
         for therapist in therapists_data:
-            therapist_name = therapist.get('name', f"Therapist ID {therapist.get('id')}")
-            dept_id = therapist.get('department_id')
-            
-            # Track department coverage
-            if dept_id not in department_coverage:
-                department_coverage[dept_id] = []
-            department_coverage[dept_id].append(therapist_name)
-            
-            # Check if therapist has availability
-            if not therapist.get('availability') or len(therapist['availability']) == 0:
-                errors.append(f"{therapist_name}: No availability schedule set")
+            if not therapist.get('id'):
+                errors.append(f"Therapist missing required ID: {therapist}")
                 continue
-            
-            # Validate availability time slots
-            for avail in therapist['availability']:
-                if not self._is_valid_day(avail['day_of_week']):
-                    errors.append(f"{therapist_name}: Invalid day '{avail['day_of_week']}'")
                 
-                if not self._is_valid_time_range(avail['start_time'], avail['end_time']):
-                    errors.append(f"{therapist_name}: Invalid time range {avail['start_time']}-{avail['end_time']}")
-        
-        # Check if all departments have at least one therapist
-        if not department_coverage:
-            errors.append("No therapists available for any department")
-        
-        for dept_id, therapist_list in department_coverage.items():
-            if len(therapist_list) == 0:
-                errors.append(f"Department {dept_id}: No available therapists")
+            if not therapist.get('name'):
+                errors.append(f"Therapist {therapist.get('id')} missing name")
+            
+            if not therapist.get('department_id'):
+                errors.append(f"Therapist {therapist.get('name', therapist.get('id'))} has no department assignment")
+            
+            if not therapist.get('availability'):
+                errors.append(f"Therapist {therapist.get('name')} has no availability set")
         
         return len(errors) == 0, errors
 
-    def validate_capacity_limits(self, children_data: List[Dict[str, Any]], therapists_data: List[Dict[str, Any]]) -> Tuple[bool, List[str]]:
-        """Check if therapist capacity can handle child requirements"""
-        errors = []
+    def validate_capacity_limits(self, children_data: List[Dict], therapists_data: List[Dict]) -> Tuple[bool, List[str]]:
         warnings = []
         
-        # Calculate total session demand
-        total_sessions_needed = 0
-        sessions_by_department = {}
+        total_child_sessions = sum(
+            sum(dept.get('sessions_per_week', 0) for dept in child.get('departments', []))
+            for child in children_data
+        )
         
+        total_therapist_capacity = len(therapists_data) * self.max_sessions_per_therapist_per_day * 6
+        
+        if total_child_sessions > total_therapist_capacity:
+            warnings.append(f"Demand ({total_child_sessions} sessions) exceeds therapist capacity ({total_therapist_capacity} sessions)")
+        
+        department_demand = {}
         for child in children_data:
             for dept in child.get('departments', []):
-                dept_id = dept['department_id']
-                sessions_needed = dept['sessions_per_week']
-                
-                total_sessions_needed += sessions_needed
-                if dept_id not in sessions_by_department:
-                    sessions_by_department[dept_id] = 0
-                sessions_by_department[dept_id] += sessions_needed
+                dept_name = dept.get('department_name', 'Unknown')
+                sessions = dept.get('sessions_per_week', 0)
+                department_demand[dept_name] = department_demand.get(dept_name, 0) + sessions
         
-        # Calculate available therapist capacity
-        therapist_capacity_by_dept = {}
-        total_therapist_capacity = 0
-        
+        department_capacity = {}
         for therapist in therapists_data:
-            dept_id = therapist['department_id']
-            
-            # Calculate weekly capacity based on availability
-            weekly_capacity = self._calculate_therapist_weekly_capacity(therapist['availability'])
-            total_therapist_capacity += weekly_capacity
-            
-            if dept_id not in therapist_capacity_by_dept:
-                therapist_capacity_by_dept[dept_id] = 0
-            therapist_capacity_by_dept[dept_id] += weekly_capacity
+            dept_name = therapist.get('department_name', 'Unknown')
+            capacity = self.max_sessions_per_therapist_per_day * 6
+            department_capacity[dept_name] = department_capacity.get(dept_name, 0) + capacity
         
-        # Check overall capacity
-        if total_sessions_needed > total_therapist_capacity:
-            errors.append(f"Insufficient therapist capacity: {total_sessions_needed} sessions needed, {total_therapist_capacity} available")
+        for dept, demand in department_demand.items():
+            capacity = department_capacity.get(dept, 0)
+            if demand > capacity:
+                warnings.append(f"{dept} department: demand ({demand}) exceeds capacity ({capacity})")
         
-        # Check department-specific capacity
-        for dept_id, sessions_needed in sessions_by_department.items():
-            available_capacity = therapist_capacity_by_dept.get(dept_id, 0)
-            
-            if sessions_needed > available_capacity:
-                errors.append(f"Department {dept_id}: {sessions_needed} sessions needed, {available_capacity} available")
-            elif sessions_needed > available_capacity * 0.8:  # 80% capacity warning
-                warnings.append(f"Department {dept_id}: High utilization ({sessions_needed}/{available_capacity})")
-        
-        return len(errors) == 0, errors + warnings
+        return True, warnings
 
-    def validate_session_update(self, session_data: Dict[str, Any], existing_sessions: List[Dict[str, Any]]) -> Tuple[bool, List[str]]:
-        """Validate manual session updates for conflicts"""
-        errors = []
-        
-        # Time validation
-        if 'start_time' in session_data and 'end_time' in session_data:
-            if not self._is_valid_time_range(session_data['start_time'], session_data['end_time']):
-                errors.append("Invalid time range")
-        
-        # Check for therapist conflicts
-        if 'therapist_id' in session_data and 'date' in session_data:
-            for existing in existing_sessions:
-                if (existing['therapist_id'] == session_data['therapist_id'] and 
-                    existing['date'] == session_data['date']):
-                    
-                    if self._times_overlap(
-                        session_data.get('start_time'), session_data.get('end_time'),
-                        existing['start_time'], existing['end_time']
-                    ):
-                        errors.append(f"Therapist conflict: overlapping session at {existing['start_time']}-{existing['end_time']}")
-        
-        return len(errors) == 0, errors
-
-    def _is_valid_day(self, day: str) -> bool:
-        """Check if day is valid working day"""
-        return day in self.valid_days
-
-    def _is_valid_time_range(self, start_time: time, end_time: time) -> bool:
-        """Validate time range within working hours"""
-        if isinstance(start_time, str):
-            start_time = datetime.strptime(start_time, "%H:%M").time()
-        if isinstance(end_time, str):
-            end_time = datetime.strptime(end_time, "%H:%M").time()
-        
-        if start_time >= end_time:
-            return False
-        
+    def validate_session_time(self, start_time: time, end_time: time) -> bool:
         if start_time < self.working_hours_start or end_time > self.working_hours_end:
             return False
-        
-        # Check if duration is reasonable (30 minutes to 2 hours)
-        duration = datetime.combine(date.today(), end_time) - datetime.combine(date.today(), start_time)
-        duration_minutes = duration.total_seconds() / 60
-        
-        return 30 <= duration_minutes <= 120
+        if start_time >= end_time:
+            return False
+        return True
 
-    def _calculate_therapist_weekly_capacity(self, availability: List[Dict[str, Any]]) -> int:
-        """Calculate maximum sessions per week for a therapist"""
-        total_hours = 0
-        
-        for avail in availability:
-            start_time = avail['start_time']
-            end_time = avail['end_time']
-            
-            if isinstance(start_time, str):
-                start_time = datetime.strptime(start_time, "%H:%M").time()
-            if isinstance(end_time, str):
-                end_time = datetime.strptime(end_time, "%H:%M").time()
-            
-            duration = datetime.combine(date.today(), end_time) - datetime.combine(date.today(), start_time)
-            total_hours += duration.total_seconds() / 3600
-        
-        # Assume 1-hour sessions, with some buffer time between sessions
-        return int(total_hours * 0.8)  # 80% efficiency factor
+    def validate_session_duration(self, start_time: time, end_time: time) -> bool:
+        start_minutes = start_time.hour * 60 + start_time.minute
+        end_minutes = end_time.hour * 60 + end_time.minute
+        duration = end_minutes - start_minutes
+        return duration == self.session_duration_minutes
 
-    def _times_overlap(self, start1: time, end1: time, start2: time, end2: time) -> bool:
-        """Check if two time ranges overlap"""
-        if isinstance(start1, str):
-            start1 = datetime.strptime(start1, "%H:%M").time()
-        if isinstance(end1, str):
-            end1 = datetime.strptime(end1, "%H:%M").time()
-        if isinstance(start2, str):
-            start2 = datetime.strptime(start2, "%H:%M").time()
-        if isinstance(end2, str):
-            end2 = datetime.strptime(end2, "%H:%M").time()
+    def validate_day_of_week(self, day: str) -> bool:
+        return day in self.valid_days
+
+    def validate_session_conflicts(self, sessions: List[Dict], new_session: Dict) -> List[str]:
+        conflicts = []
         
-        return start1 < end2 and start2 < end1
+        new_start = datetime.strptime(f"{new_session['date']} {new_session['start_time']}", "%Y-%m-%d %H:%M:%S")
+        new_end = datetime.strptime(f"{new_session['date']} {new_session['end_time']}", "%Y-%m-%d %H:%M:%S")
+        
+        for session in sessions:
+            if session.get('id') == new_session.get('id'):
+                continue
+                
+            start = datetime.strptime(f"{session['date']} {session['start_time']}", "%Y-%m-%d %H:%M:%S")
+            end = datetime.strptime(f"{session['date']} {session['end_time']}", "%Y-%m-%d %H:%M:%S")
+            
+            if new_start < end and new_end > start:
+                if session['child_id'] == new_session['child_id']:
+                    conflicts.append(f"Child conflict with existing session at {session['start_time']}")
+                if session['therapist_id'] == new_session['therapist_id']:
+                    conflicts.append(f"Therapist conflict with existing session at {session['start_time']}")
+        
+        return conflicts
+
+    def validate_weekly_limits(self, sessions: List[Dict], child_id: int, therapist_id: int, date_obj: date) -> List[str]:
+        warnings = []
+        
+        week_start = date_obj - timedelta(days=date_obj.weekday())
+        week_end = week_start + timedelta(days=6)
+        
+        child_sessions_this_week = [
+            s for s in sessions 
+            if s['child_id'] == child_id and week_start <= datetime.strptime(s['date'], "%Y-%m-%d").date() <= week_end
+        ]
+        
+        therapist_sessions_this_week = [
+            s for s in sessions 
+            if s['therapist_id'] == therapist_id and week_start <= datetime.strptime(s['date'], "%Y-%m-%d").date() <= week_end
+        ]
+        
+        child_daily_count = {}
+        therapist_daily_count = {}
+        
+        for session in child_sessions_this_week:
+            day = session['date']
+            child_daily_count[day] = child_daily_count.get(day, 0) + 1
+        
+        for session in therapist_sessions_this_week:
+            day = session['date']
+            therapist_daily_count[day] = therapist_daily_count.get(day, 0) + 1
+        
+        for day, count in child_daily_count.items():
+            if count >= self.max_sessions_per_child_per_day:
+                warnings.append(f"Child approaching daily limit ({count}/{self.max_sessions_per_child_per_day}) on {day}")
+        
+        for day, count in therapist_daily_count.items():
+            if count >= self.max_sessions_per_therapist_per_day:
+                warnings.append(f"Therapist approaching daily limit ({count}/{self.max_sessions_per_therapist_per_day}) on {day}")
+        
+        return warnings

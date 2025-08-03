@@ -5,7 +5,7 @@ import random
 from dataclasses import dataclass, field
 
 from app.utils.data_helpers import TimetableDataHelper
-from app.utils.validators import TimetableValidator, ValidationError
+from app.utils.validators import TimetableValidator
 
 @dataclass
 class SessionSlot:
@@ -121,30 +121,29 @@ class SmartTimetableEngine:
             )
 
     def _validate_generation_request(self, week_starting: date, active_children: List[int], 
-                                   active_therapists: List[int], regenerate_existing: bool) -> GenerationResult:
-        """Comprehensive validation of generation request"""
-        
-        # Check if sessions already exist
-        if not regenerate_existing and self.db_helper.check_existing_sessions(week_starting):
-            return GenerationResult(
-                success=False,
-                sessions_created=0,
-                errors=["Sessions already exist for this week. Use regenerate_existing=true to overwrite."]
-            )
+                                    active_therapists: List[int], regenerate_existing: bool) -> GenerationResult:
+            
+            if not regenerate_existing and self.db_helper.check_existing_sessions(week_starting):
+                return GenerationResult(
+                    success=False,
+                    sessions_created=0,
+                    errors=["Sessions already exist for this week. Use regenerate_existing=true to overwrite."]
+                )
 
-        # Basic input validation
-        if not active_children:
-            return GenerationResult(success=False, sessions_created=0, errors=["No children selected"])
-        
-        if not active_therapists:
-            return GenerationResult(success=False, sessions_created=0, errors=["No therapists selected"])
+            if not active_children:
+                return GenerationResult(success=False, sessions_created=0, errors=["No children selected"])
+            
+            if not active_therapists:
+                return GenerationResult(success=False, sessions_created=0, errors=["No therapists selected"])
 
-        # Date validation
-        if week_starting.weekday() != 0:
-            return GenerationResult(success=False, sessions_created=0, errors=["Week must start on Monday"])
+            if week_starting < date.today() - timedelta(days=365):
+                return GenerationResult(success=False, sessions_created=0, errors=["Cannot generate timetable more than 1 year in the past"])
 
-        return GenerationResult(success=True, sessions_created=0)
+            if week_starting > date.today() + timedelta(days=365):
+                return GenerationResult(success=False, sessions_created=0, errors=["Cannot generate timetable more than 1 year in the future"])
 
+            return GenerationResult(success=True, sessions_created=0)
+    
     def _validate_input_data(self, children_data: List[Dict], therapists_data: List[Dict]) -> GenerationResult:
         """Validate children and therapist data"""
         
