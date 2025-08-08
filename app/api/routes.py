@@ -69,8 +69,21 @@ def get_children(db: Session = Depends(get_db)):
     children = db.query(Child).filter(Child.is_active == True).all()
     result = []
     for child in children:
-        departments = db.query(ChildDepartment).filter(ChildDepartment.child_id == child.id).all()
-        dept_info = [{"department_id": cd.department_id, "sessions_per_week": cd.sessions_per_week} for cd in departments]
+        departments = (
+            db.query(ChildDepartment)
+            .join(Department, ChildDepartment.department_id == Department.id)
+            .filter(ChildDepartment.child_id == child.id)
+            .all()
+        )
+        
+        dept_info = []
+        for cd in departments:
+            dept_info.append({
+                "department_id": cd.department_id,
+                "department_name": cd.department.name,
+                "sessions_per_week": cd.sessions_per_week
+            })
+        
         result.append({
             "id": child.id,
             "name": child.name,
@@ -163,6 +176,10 @@ def remove_child_department(child_id: int, dept_id: int, db: Session = Depends(g
 
 @router.post("/children/{child_id}/availability")
 def add_child_availability(child_id: int, availability: AvailabilityCreate, db: Session = Depends(get_db)):
+    db.query(ChildAvailability).filter(
+        and_(ChildAvailability.child_id == child_id, ChildAvailability.day_of_week == availability.day_of_week)
+    ).delete()
+    
     new_availability = ChildAvailability(
         child_id=child_id,
         day_of_week=availability.day_of_week,
@@ -173,7 +190,7 @@ def add_child_availability(child_id: int, availability: AvailabilityCreate, db: 
     db.commit()
     
     redis_helper.invalidate_child_cache(child_id)
-    return {"message": "Availability added successfully"}
+    return {"message": "Availability updated successfully"}
 
 @router.get("/children/{child_id}/availability")
 def get_child_availability(child_id: int, db: Session = Depends(get_db)):
@@ -205,15 +222,20 @@ def get_therapists(db: Session = Depends(get_db)):
     if cached_data:
         return cached_data
     
-    therapists = db.query(Therapist).filter(Therapist.is_active == True).all()
+    therapists = (
+        db.query(Therapist)
+        .join(Department, Therapist.department_id == Department.id)
+        .filter(Therapist.is_active == True)
+        .all()
+    )
+    
     result = []
     for therapist in therapists:
-        department = db.query(Department).filter(Department.id == therapist.department_id).first()
         result.append({
             "id": therapist.id,
             "name": therapist.name,
             "department_id": therapist.department_id,
-            "department_name": department.name if department else None,
+            "department_name": therapist.department.name,
             "is_active": therapist.is_active
         })
     
@@ -258,17 +280,22 @@ def toggle_therapist_availability(therapist_id: int, db: Session = Depends(get_d
 
 @router.post("/therapists/{therapist_id}/availability")
 def add_therapist_availability(therapist_id: int, availability: AvailabilityCreate, db: Session = Depends(get_db)):
+    db.query(TherapistAvailability).filter(
+        and_(TherapistAvailability.therapist_id == therapist_id, TherapistAvailability.day_of_week == availability.day_of_week)
+    ).delete()
+    
     new_availability = TherapistAvailability(
         therapist_id=therapist_id,
         day_of_week=availability.day_of_week,
         start_time=availability.start_time,
-        end_time=availability.end_time
+        end_time=availability.end_time,
+        is_available=True
     )
     db.add(new_availability)
     db.commit()
     
     redis_helper.invalidate_therapist_cache(therapist_id)
-    return {"message": "Therapist availability added successfully"}
+    return {"message": "Therapist availability updated successfully"}
 
 @router.get("/therapists/{therapist_id}/availability")
 def get_therapist_availability(therapist_id: int, db: Session = Depends(get_db)):
@@ -282,16 +309,30 @@ def get_therapist_availability(therapist_id: int, db: Session = Depends(get_db))
     redis_helper.cache_therapist_availability(therapist_id, result)
     return result
 
-@router.put("/therapist-availability/{availability_id}/toggle")
-def toggle_therapist_day_availability(availability_id: int, db: Session = Depends(get_db)):
-    availability = db.query(TherapistAvailability).filter(TherapistAvailability.id == availability_id).first()
-    if not availability:
-        raise HTTPException(status_code=404, detail="Availability not found")
+@router.put("/therapist-availability/{therapist_id}/day/{day}")
+def toggle_therapist_day_availability(therapist_id: int, day: str, db: Session = Depends(get_db)):
+    availability = db.query(TherapistAvailability).filter(
+        and_(TherapistAvailability.therapist_id == therapist_id, TherapistAvailability.day_of_week == day)
+    ).first()
     
-    availability.is_available = not availability.is_available
-    db.commit()
-    redis_helper.invalidate_therapist_cache(availability.therapist_id)
-    return {"message": f"Availability toggled to {'available' if availability.is_available else 'unavailable'}"}
+    if availability:
+        availability.is_available = not availability.is_available
+        db.commit()
+        message = f"Therapist marked {'available' if availability.is_available else 'unavailable'} for {day}"
+    else:
+        new_availability = TherapistAvailability(
+            therapist_id=therapist_id,
+            day_of_week=day,
+            start_time=availability.start_time,
+            end_time=availability.end_time,
+            is_available=False
+        )
+        db.add(new_availability)
+        db.commit()
+        message = f"Therapist marked unavailable for {day}"
+    
+    redis_helper.invalidate_therapist_cache(therapist_id)
+    return {"message": message}
 
 @router.post("/generate-timetable")
 def generate_weekly_timetable(request: TimetableGenerationRequest, db: Session = Depends(get_db)):
@@ -717,3 +758,26 @@ def quick_timetable_setup(week_starting: date, copy_from_week: Optional[date] = 
                 "error": str(e)
             }
         )
+
+@router.put("/child-availability/{child_id}/day/{day}")
+def toggle_child_day_availability(child_id: int, day: str, db: Session = Depends(get_db)):
+    existing = db.query(ChildAvailability).filter(
+        and_(ChildAvailability.child_id == child_id, ChildAvailability.day_of_week == day)
+    ).first()
+    
+    if existing:
+        db.delete(existing)
+        message = f"Child marked unavailable for {day}"
+    else:
+        new_availability = ChildAvailability(
+            child_id=child_id,
+            day_of_week=day,
+            start_time=availability.start_time,
+            end_time=availability.end_time
+        )
+        db.add(new_availability)
+        message = f"Child marked available for {day}"
+    
+    db.commit()
+    redis_helper.invalidate_child_cache(child_id)
+    return {"message": message}
